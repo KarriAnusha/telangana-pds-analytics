@@ -181,8 +181,9 @@ def load_all_datasets(data_root: str = "data"):
         transactions,
         ["shopNo", "distCode", "noOfTrans", "otherShopTrans", "riceQty", "wheatQty", "year", "month"],
     )
-    card_status = _coerce_numeric(card_status, ["shopNo", "distCode", "totalRcs"])
+    card_status = _coerce_numeric(card_status, ["shopNo", "distCode", "totalRcs", "year", "month"])
     fps_locations = _coerce_numeric(fps_locations, ["shopNo", "distCode", "latitude", "longitude"])
+    card_status = _ensure_time_columns(card_status)
 
     transactions = _ensure_time_columns(transactions)
 
@@ -192,7 +193,15 @@ def load_all_datasets(data_root: str = "data"):
 def create_unified_dataset(transactions: pd.DataFrame,
                            card_status: pd.DataFrame,
                            fps_locations: pd.DataFrame) -> pd.DataFrame:
-    """Triple-Join on shopNo and distCode to create a single unified dataset."""
+    """Triple-Join to create a single unified dataset.
+
+    Card-status is joined on shopNo + distCode + year + month so that each
+    transaction row is matched to the card count for that exact month.  This
+    prevents a Cartesian-product explosion (and inflated utilization ratios)
+    that occurs when a shop has multiple card-status rows across months.
+    Falls back to a shop-level dedup join when year/month are absent from
+    card_status.
+    """
     for key in ["shopNo", "distCode"]:
         if key not in transactions.columns:
             raise KeyError(f"Missing required key in transactions: {key}")
@@ -201,9 +210,38 @@ def create_unified_dataset(transactions: pd.DataFrame,
         if key not in fps_locations.columns:
             raise KeyError(f"Missing required key in fps_locations: {key}")
 
+    # Determine whether we can do a time-aware join
+    time_keys = ["year", "month"]
+    can_join_on_time = all(
+        k in transactions.columns and k in card_status.columns
+        for k in time_keys
+    )
+
+    if can_join_on_time:
+        # Best path: match each transaction month to the correct card count
+        card_cols = ["shopNo", "distCode", "year", "month", "totalRcs"]
+        card_cols = [c for c in card_cols if c in card_status.columns]
+        # Keep only the highest totalRcs per (shop, month) to avoid
+        # duplicates from multiple card-type rows in the same month
+        card_dedup = (
+            card_status[card_cols]
+            .groupby(["shopNo", "distCode", "year", "month"], dropna=False)["totalRcs"]
+            .max()
+            .reset_index()
+        )
+        join_keys = ["shopNo", "distCode", "year", "month"]
+    else:
+        # Fallback: one row per shop (average totalRcs across all available months)
+        card_dedup = (
+            card_status.groupby(["shopNo", "distCode"], dropna=False)["totalRcs"]
+            .mean()
+            .reset_index()
+        )
+        join_keys = ["shopNo", "distCode"]
+
     unified = transactions.merge(
-        card_status,
-        on=["shopNo", "distCode"],
+        card_dedup,
+        on=join_keys,
         how="left",
         suffixes=("", "_card"),
     )
