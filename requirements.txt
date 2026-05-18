@@ -7,6 +7,6 @@ streamlit-folium
 matplotlib
 seaborn
 plotly
-jupyter
-notebook
+ipykernel
+notebook<7
 openpyxl

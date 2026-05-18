@@ -29,6 +29,24 @@ def _best_k_row(diagnostics: pd.DataFrame) -> pd.Series | None:
     return valid.sort_values("silhouette", ascending=False).iloc[0]
 
 
+def _to_markdown_table(df: pd.DataFrame, index: bool = True) -> str:
+    """Render a small DataFrame as Markdown without optional tabulate dependency."""
+    out = df.copy()
+    if index:
+        index_name = out.index.name or ""
+        out = out.reset_index().rename(columns={out.index.name or "index": index_name})
+    out = out.fillna("")
+    headers = [str(c) for c in out.columns]
+    rows = out.astype(str).values.tolist()
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
 def write_report(artifacts: dict) -> None:
     shop_features = artifacts["shop_features"]
     profiles = artifacts["cluster_profiles"]
@@ -56,6 +74,11 @@ def write_report(artifacts: dict) -> None:
     lines.append(f"- Silhouette score (selected K): {artifacts['silhouette_score']:.4f}")
     if best_k is not None:
         lines.append(f"- Best K by silhouette curve: {int(best_k['k'])} ({best_k['silhouette']:.4f})")
+        if int(best_k["k"]) != artifacts["kmeans_model"].n_clusters:
+            lines.append(
+                "- Note: K=5 is retained for operationally useful shop personas, "
+                "even though the silhouette curve prefers a different K."
+            )
     if purity is not None:
         lines.append(f"- Cluster purity vs districtType: {purity:.4f}")
     else:
@@ -64,7 +87,7 @@ def write_report(artifacts: dict) -> None:
     lines.append("")
     lines.append("## Cluster Profiles")
     lines.append("")
-    lines.append(profiles.round(4).to_markdown())
+    lines.append(_to_markdown_table(profiles.round(4)))
 
     lines.append("")
     lines.append("## Top Suspicious Shops (Fraud Risk Proxy)")
@@ -77,7 +100,7 @@ def write_report(artifacts: dict) -> None:
             for c in ["shopNo", "distCode", "distName", "kmeans_cluster", "meanTransactionToCardRatio", "clusterZScore"]
             if c in suspicious.columns
         ]
-        lines.append(suspicious[cols].head(20).round(4).to_markdown(index=False))
+        lines.append(_to_markdown_table(suspicious[cols].head(20).round(4), index=False))
 
     lines.append("")
     lines.append("## Portability Hubs (Logistics Priority)")
@@ -90,7 +113,7 @@ def write_report(artifacts: dict) -> None:
             for c in ["shopNo", "distCode", "distName", "kmeans_cluster", "portabilityLoad", "totalOtherShopTrans"]
             if c in hubs.columns
         ]
-        lines.append(hubs[cols].head(20).round(4).to_markdown(index=False))
+        lines.append(_to_markdown_table(hubs[cols].head(20).round(4), index=False))
 
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
 

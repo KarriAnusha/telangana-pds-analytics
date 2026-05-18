@@ -17,12 +17,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from data_processing import (
-    load_all_datasets, create_unified_dataset, engineer_features,
-    compute_shop_level_features, attach_location_info,
-    scale_features, run_pca, find_optimal_k,
-    run_kmeans, run_dbscan, build_cluster_profiles,
-    flag_suspicious_shops, identify_portability_hubs,
-    pre_filter_extreme_outliers, assign_cluster_personas,
+    run_full_pipeline,
     CLUSTER_FEATURES,
 )
 
@@ -62,30 +57,17 @@ def load_processed_data():
         diagnostics = pd.read_csv(diagnostics_path) if os.path.exists(diagnostics_path) else None
         return unified, shop_features, profiles, suspicious, hubs, diagnostics
 
-    # Run pipeline from raw CSVs
-    transactions, card_status, fps_locations = load_all_datasets(DATA_ROOT)
-    unified = create_unified_dataset(transactions, card_status, fps_locations)
-    unified = engineer_features(unified)
-
-    shop_features = compute_shop_level_features(unified)
-    shop_features = attach_location_info(shop_features, fps_locations)
-
-    X_scaled, _, active_features = scale_features(shop_features)
-    X_pca, _ = run_pca(X_scaled, n_components=3)
-    shop_features["pca1"] = X_pca[:, 0]
-    shop_features["pca2"] = X_pca[:, 1]
-    shop_features["pca3"] = X_pca[:, 2] if X_pca.shape[1] >= 3 else 0
-
-    km_labels, _ = run_kmeans(X_scaled, n_clusters=5)
-    shop_features["kmeans_cluster"] = km_labels
-
-    db_labels, _ = run_dbscan(X_scaled, eps=1.5, min_samples=5)
-    shop_features["dbscan_cluster"] = db_labels
-
-    profiles = build_cluster_profiles(shop_features, features=active_features)
-    suspicious = flag_suspicious_shops(shop_features)
-    hubs = identify_portability_hubs(shop_features)
-    k_vals, inertias, sil_scores = find_optimal_k(X_scaled)
+    # Run the same full pipeline used by scripts/run_pipeline.py so dashboard
+    # results match exported reports and processed CSVs.
+    artifacts = run_full_pipeline(DATA_ROOT, n_clusters=5, dbscan_eps=1.5, dbscan_min_samples=5)
+    unified = artifacts["unified"]
+    shop_features = artifacts["shop_features"]
+    profiles = artifacts["cluster_profiles"]
+    suspicious = artifacts["suspicious_shops"]
+    hubs = artifacts["portability_hubs"]
+    k_vals = artifacts["k_values"]
+    inertias = artifacts["inertias"]
+    sil_scores = artifacts["silhouette_by_k"]
     diagnostics = pd.DataFrame({
         "k": k_vals,
         "inertia": inertias,
@@ -213,12 +195,44 @@ selected_districts = st.sidebar.multiselect(
 years = sorted(unified["year"].dropna().unique())
 selected_years = st.sidebar.multiselect("Select Year(s)", years, default=years) if years else []
 
-# Filter unified data by year; shop features by district
+# Filter transactions by both district and year. Shop-level cluster features are
+# built over the full available history, but the year filter still limits maps,
+# search, risk tables, and KPIs to shops active in the selected transaction years.
 if "year" in unified.columns and selected_years:
     unified_filtered = unified[unified["year"].isin(selected_years)]
 else:
     unified_filtered = unified.copy()
-shop_filtered = shop_features[shop_features[dist_col].isin(selected_districts)]
+
+if selected_districts and dist_col in unified_filtered.columns:
+    unified_filtered = unified_filtered[unified_filtered[dist_col].isin(selected_districts)]
+elif not selected_districts:
+    unified_filtered = unified_filtered.iloc[0:0]
+
+shop_filtered = shop_features[shop_features[dist_col].isin(selected_districts)].copy()
+if not unified_filtered.empty and {"shopNo", "distCode"}.issubset(unified_filtered.columns):
+    active_shop_keys = unified_filtered[["shopNo", "distCode"]].drop_duplicates()
+    shop_filtered = shop_filtered.merge(
+        active_shop_keys,
+        on=["shopNo", "distCode"],
+        how="inner",
+    )
+else:
+    active_shop_keys = pd.DataFrame(columns=["shopNo", "distCode"])
+    shop_filtered = shop_filtered.iloc[0:0]
+
+if suspicious_shops is not None and not suspicious_shops.empty:
+    suspicious_filtered = suspicious_shops[suspicious_shops[dist_col].isin(selected_districts)].copy()
+    if not active_shop_keys.empty:
+        suspicious_filtered = suspicious_filtered.merge(active_shop_keys, on=["shopNo", "distCode"], how="inner")
+else:
+    suspicious_filtered = suspicious_shops
+
+if portability_hubs is not None and not portability_hubs.empty:
+    hubs_filtered = portability_hubs[portability_hubs[dist_col].isin(selected_districts)].copy()
+    if not active_shop_keys.empty:
+        hubs_filtered = hubs_filtered.merge(active_shop_keys, on=["shopNo", "distCode"], how="inner")
+else:
+    hubs_filtered = portability_hubs
 
 
 # ── Title ────────────────────────────────────────────────────────────────────
@@ -811,7 +825,7 @@ with tab_profile:
 
     st.subheader("DBSCAN Outlier Summary")
     if "dbscan_cluster" in shop_features.columns:
-        outliers = shop_features[shop_features["dbscan_cluster"] == -1]
+        outliers = shop_filtered[shop_filtered["dbscan_cluster"] == -1]
         st.write(f"**{len(outliers)}** shops flagged as outliers by DBSCAN")
         if not outliers.empty:
             st.dataframe(
@@ -828,9 +842,9 @@ with tab_profile:
 
     st.subheader("Clustering Diagnostics")
     st.caption(
-        "These two charts were used to decide the optimal number of clusters (k=5) "
-        "for grouping shops. Look for the 'elbow' on the left chart and the highest "
-        "useful score on the right."
+        "These charts compare candidate K-Means cluster counts. This dashboard uses "
+        "k=5 for business-friendly personas, while the silhouette chart shows whether "
+        "a smaller or larger k is mathematically cleaner."
     )
     if diagnostics is not None and not diagnostics.empty:
         left, right = st.columns(2)
@@ -848,14 +862,14 @@ with tab_profile:
             )
             fig_elbow.add_vline(
                 x=5, line_dash="dash", line_color="red",
-                annotation_text="Chosen k=5", annotation_position="top right",
+                annotation_text="Dashboard k=5", annotation_position="top right",
             )
             st.plotly_chart(fig_elbow, use_container_width=True)
             st.caption(
                 "**X-axis (k):** how many groups we split shops into.  \n"
                 "**Y-axis (Inertia):** total spread inside clusters — lower is better.  \n"
-                "The curve bends ('elbows') at k=5, meaning adding more clusters after "
-                "that gives diminishing returns."
+                "Use the elbow curve to judge whether adding more clusters gives meaningfully "
+                "tighter groups. k=5 is retained here because it gives interpretable shop personas."
             )
         with right:
             fig_sil = px.line(
@@ -871,14 +885,14 @@ with tab_profile:
             )
             fig_sil.add_vline(
                 x=5, line_dash="dash", line_color="red",
-                annotation_text="Chosen k=5", annotation_position="top right",
+                annotation_text="Dashboard k=5", annotation_position="top right",
             )
             st.plotly_chart(fig_sil, use_container_width=True)
             st.caption(
                 "**X-axis (k):** number of clusters.  \n"
                 "**Y-axis (Silhouette Score, 0–1):** how well each shop fits its own "
                 "cluster vs. the nearest other cluster. Higher = cleaner separation.  \n"
-                "Score drops sharply at k=6, confirming k=5 is the last stable choice."
+                "k=5 is a presentation choice for richer operational profiling, not necessarily the top silhouette score."
             )
 
 # ── TAB 4: Geospatial Hotspot Map ───────────────────────────────────────────
@@ -1078,10 +1092,10 @@ with tab_risk:
         "is significantly higher than other shops in the same cluster. "
         "The **Reason for Flagging** column explains in plain language what was unusual."
     )
-    if suspicious_shops is None or suspicious_shops.empty:
+    if suspicious_filtered is None or suspicious_filtered.empty:
         st.info("No suspicious shops detected with current threshold.")
     else:
-        display_susp = suspicious_shops.copy()
+        display_susp = suspicious_filtered.copy()
         display_susp["Reason for Flagging"] = display_susp.apply(compute_risk_reason, axis=1)
         cols = [
             "shopNo", dist_col, "clusterPersona", "kmeans_cluster",
@@ -1108,9 +1122,9 @@ with tab_risk:
             "A score above 2.5 is flagged. Higher = more unusual."
         )
         # ── Fraud table result summary ──────────────────────────────────
-        n_flagged = len(suspicious_shops)
-        n_total_shops = shop_features["shopNo"].nunique()
-        n_extreme = int((suspicious_shops["meanUtilization"] > 1.5).sum()) if "meanUtilization" in suspicious_shops.columns else 0
+        n_flagged = len(suspicious_filtered)
+        n_total_shops = shop_filtered["shopNo"].nunique()
+        n_extreme = int((suspicious_filtered["meanUtilization"] > 1.5).sum()) if "meanUtilization" in suspicious_filtered.columns else 0
         flag_pct = n_flagged / n_total_shops * 100 if n_total_shops > 0 else 0
         st.warning(
             f"**Result:** **{n_flagged:,} shops** ({flag_pct:.1f}% of all shops) were flagged as suspicious. "
@@ -1121,17 +1135,17 @@ with tab_risk:
         )
 
     st.subheader("Logistics Optimization: Portability Hubs")
-    if portability_hubs is None or portability_hubs.empty:
+    if hubs_filtered is None or hubs_filtered.empty:
         st.info("No portability hubs identified.")
     else:
         cols = ["shopNo", dist_col, "clusterPersona", "kmeans_cluster", "portabilityLoad", "totalOtherShopTrans"]
-        cols = [c for c in cols if c in portability_hubs.columns]
-        st.dataframe(portability_hubs[cols].head(100), use_container_width=True)
+        cols = [c for c in cols if c in hubs_filtered.columns]
+        st.dataframe(hubs_filtered[cols].head(100), use_container_width=True)
         # ── Portability hubs result summary ─────────────────────────────
-        n_hubs = len(portability_hubs)
-        if "portabilityLoad" in portability_hubs.columns:
-            avg_hub_load = float(portability_hubs["portabilityLoad"].mean())
-            top_hub_dist = portability_hubs[dist_col].value_counts().idxmax() if dist_col in portability_hubs.columns else "N/A"
+        n_hubs = len(hubs_filtered)
+        if "portabilityLoad" in hubs_filtered.columns:
+            avg_hub_load = float(hubs_filtered["portabilityLoad"].mean())
+            top_hub_dist = hubs_filtered[dist_col].value_counts().idxmax() if dist_col in hubs_filtered.columns else "N/A"
             st.info(
                 f"**Result:** **{n_hubs:,} shops** qualify as portability hubs, each serving a high share of "
                 f"out-of-shop card-holders (average load: **{avg_hub_load*100:.0f}%**). "
