@@ -138,6 +138,7 @@ PERSONA_COLORS = {
     "High-Volume Urban Hubs": "#ff7f0e",
     "Volatile Portability Hubs": "#d62728",
     "Anomalous High-Utilization": "#9467bd",
+    "Extreme Anomaly": "#e377c2",
     "Extreme Anomaly (Pre-filtered)": "#e377c2",
 }
 CLUSTER_COLORS = [
@@ -355,6 +356,10 @@ with tab_map:
 | 🟣 Purple | **Anomalous High-Utilization** | Transactions exceed registered card base — statistically impossible under clean data. Highest fraud risk. |
 | 🩷 Pink | **Extreme Anomaly (Pre-filtered)** | Transaction-to-card ratio so extreme the shop was isolated before clustering. Immediate review recommended. |
         """)
+        st.caption(
+            "Map persona is risk-aware: shops with clusterZScore >= 2.5 display as "
+            "Anomalous High-Utilization, and DBSCAN outliers display as Extreme Anomaly."
+        )
     if not has_coords:
         st.warning("Latitude/Longitude columns not found in the FPS location data.")
     else:
@@ -367,6 +372,18 @@ with tab_map:
             else:
                 map_df["persona_label"] = map_df["kmeans_cluster"].astype(str)
 
+            map_df["base_persona"] = map_df["persona_label"]
+            map_df.loc[
+                map_df["persona_label"] == "Extreme Anomaly (Pre-filtered)",
+                "persona_label",
+            ] = "Extreme Anomaly"
+            if "clusterZScore" in map_df.columns:
+                high_util_mask = map_df["clusterZScore"] >= 2.5
+                map_df.loc[high_util_mask, "persona_label"] = "Anomalous High-Utilization"
+            if "dbscan_cluster" in map_df.columns:
+                dbscan_mask = map_df["dbscan_cluster"] == -1
+                map_df.loc[dbscan_mask, "persona_label"] = "Extreme Anomaly"
+
             fig_map = px.scatter_mapbox(
                 map_df,
                 lat="latitude",
@@ -374,7 +391,9 @@ with tab_map:
                 color="persona_label",
                 color_discrete_map=PERSONA_COLORS if has_personas else None,
                 hover_data={"shopNo": True, dist_col: True, "totalTransactions": ":,.0f",
-                            "latitude": False, "longitude": False, "persona_label": False},
+                            "base_persona": True, "clusterZScore": ":.2f",
+                            "dbscan_cluster": True, "latitude": False,
+                            "longitude": False, "persona_label": False},
                 category_orders={"persona_label": list(PERSONA_COLORS.keys())} if has_personas else None,
                 zoom=6,
                 center={"lat": map_df["latitude"].median(), "lon": map_df["longitude"].median()},
@@ -387,6 +406,7 @@ with tab_map:
                 margin=dict(l=0, r=0, t=0, b=0),
                 legend_title_text="Persona",
             )
+
             st.plotly_chart(fig_map, use_container_width=True)
             # ── Map result summary ───────────────────────────────────────────
             persona_counts = map_df["persona_label"].value_counts().reset_index()
@@ -397,15 +417,23 @@ with tab_map:
                 for _, prow in persona_counts.iterrows():
                     pct = prow["Shops"] / total_mapped * 100 if total_mapped > 0 else 0
                     st.markdown(f"- **{prow['Persona']}**: {prow['Shops']:,} shops ({pct:.1f}%)")
-                high_risk_personas = {"Anomalous High-Utilization", "Extreme Anomaly (Pre-filtered)", "Volatile Portability Hubs"}
+                zscore_count = int((map_df["clusterZScore"] >= 2.5).sum()) if "clusterZScore" in map_df.columns else 0
+                dbscan_count = int((map_df["dbscan_cluster"] == -1).sum()) if "dbscan_cluster" in map_df.columns else 0
+                st.markdown(f"- **Promoted to Anomalous High-Utilization by z-score**: {zscore_count:,} shops")
+                st.markdown(f"- **Promoted to Extreme Anomaly by DBSCAN**: {dbscan_count:,} shops")
+                high_risk_personas = {"Anomalous High-Utilization", "Extreme Anomaly", "Extreme Anomaly (Pre-filtered)", "Volatile Portability Hubs"}
                 anomalous_count = int(persona_counts[persona_counts["Persona"].isin(high_risk_personas)]["Shops"].sum())
                 if anomalous_count > 0:
                     st.warning(
                         f"**{anomalous_count:,} shops** ({anomalous_count / total_mapped * 100:.1f}%) fall into "
-                        "high-risk personas (Red, Purple, or Pink). These are the priority audit targets."
+                        "high-risk personas (Red, Purple, or Pink). Purple and Pink include shop-level anomaly "
+                        "signals from z-score and DBSCAN, not only K-Means cluster averages."
                     )
                 else:
-                    st.success("No high-risk persona shops detected in the current filter selection.")
+                    st.success(
+                        "No high-risk persona shops detected in the current filter selection. "
+                        "No high positive z-score or DBSCAN outlier shops are present for this filter."
+                    )
 
 # ── TAB 2: Shop Search Tool ─────────────────────────────────────────────────
 with tab_search:
